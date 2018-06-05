@@ -81,6 +81,9 @@ for _, f in ipairs({"sflow_245.version",
 		    "sflow_245.ifspeed",
 		    "sflow_245.ifinoct",
 		    "sflow_245.ifoutoct",
+		    "sflow_245.dot12HCInHighPriorityOctets",
+		    "sflow_245.dot12HCInNormPriorityOctets",
+		    "sflow_245.dot12HCOutHighPriorityOctets",
 		    "sflow.flow_sample.source_id_class",
 		    "sflow.flow_sample.flow_record",
 		    "eth.src","eth.dst",
@@ -222,11 +225,21 @@ local function sFlow_tap_factory()
 
 	 set_agent_interface_counters(agent, if_idx, {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = ifspeed})
 	 debug(string.format("\tifinoct: %d ifoutoct: %d ifspeed: %d", ifinoct, ifoutoct, ifspeed))
+
+      elseif enterprise == 0 and record_fmt == 4 then -- 100 BaseVG interface counters - see RFC 2020
+	 local _, ifinoct_high = get_field_value_string("sflow_245.dot12HCInHighPriorityOctets", pos_enterprise)
+	 local _, ifinoct_norm = get_field_value_string("sflow_245.dot12HCInNormPriorityOctets", pos_enterprise)
+	 local _, ifoutoct = get_field_value_string("sflow_245.dot12HCOutHighPriorityOctets", pos_enterprise)
+
+	 local ifinoct = tonumber(ifinoct_high or 0) + tonumber(ifinoct_norm or 0)
+	 ifoutoct = tonumber(ifoutoct or 0)
+
+	 set_agent_interface_counters(agent, if_idx, {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = 1000000000})
       end
    end
 
    local function process_flow_sample_record(agent, pos)
-      debug(string.format("FLOW SAMPLE RECORD: %d", pos))
+--      debug(string.format("FLOW SAMPLE RECORD: %d", pos))
       -- local pos_eth_src, eth_src = get_field_value_string("eth.src", pos)
       -- local pos_eth_dst, eth_dst = get_field_value_string("eth.dst", pos)
       -- debug(string.format("agent: %s\neth.src: %s\neth.dst: %s", agent or '', eth_src or '', eth_dst or ''))
@@ -257,7 +270,7 @@ local function sFlow_tap_factory()
       local _, source_id_class = get_field_value_number("sflow.flow_sample.source_id_class", pos)
 
       if source_id_class == 0 then -- ifIndex
-	 debug(string.format("FLOW SAMPLE: %d", pos))
+--	 debug(string.format("FLOW SAMPLE: %d", pos))
 	 local _, source_id_index = get_field_value_number("sflow.counters_sample.source_id_index", pos + 1)
 
 	 for record_pos in sample_records_iter(pos + 2, "sflow.flow_sample.flow_record") do
@@ -329,16 +342,27 @@ if gui_enabled() then
       tw:set_atclose(remove)
 
       sflow_counter_samples.tap.draw = function()
+	 num_draws = num_draws + 1
 	 debug("drawing Counter samples!")
 	 tw:clear()
-	 tw:append("num_draws: " .. num_draws .. "\n");
-	 num_draws = num_draws + 1
+	 tprint(sflow_counter_samples.res)
+	 for agent, agent_data in pairs(sflow_counter_samples.res) do
+	    tw:append(string.format("%s:\n", agent))
+
+	    for counter, counter_vals in pairs(agent_data) do
+	       tw:append(string.format("if: %d \tin bytes: %d\t out_bytes: %d",
+				       counter, counter_vals.ifinoct, counter_vals.ifoutoct))
+	    end
+	 end
       end
    end
 
    register_menu("ntop/sFlow/Counters", sflow_counter_samples_menu, MENU_TOOLS_UNSORTED)
-else
-   -- TODO: no GUI
+else -- no GUI
+   local sflow_counter_samples = sFlow_tap_factory()
+   sflow_counter_samples.tap.draw = function()
+       tprint(sflow_counter_samples.res)
+   end
 end
 
 
