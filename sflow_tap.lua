@@ -44,6 +44,16 @@ local function tprint(tbl, indent)
    end
 end
 
+-- Converts bytes into a human readable representation
+local function bytesToSize(bytes)
+   local units = {"B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"}
+   local digits = math.floor(math.log(bytes) / math.log(1024))
+
+   local fmt = string.format("%.2f %s", bytes / (1024 ^ digits), units[digits + 1])
+
+   return fmt
+end
+
 -- Print all the contents of every field. All the field getters are iterated
 -- and their values are printed.
 local function print_all_fields(get_all)
@@ -92,13 +102,14 @@ for _, f in ipairs({"sflow_245.version",
    required_fields[f] = Field.new(f)
 end
 
+-- this is going to be our counter
+local sflow_packets = 0
+-- here we will store all agents counters and flows
+local all_agents = {}
+
 local function sFlow_tap_factory()
    -- will hold all the dissected fields
    local all_fields
-   -- this is going to be our counter
-   local sflow_packets = 0
-   -- here we will store all agents counters and flows
-   local all_agents = {}
 
    local function set_agent_interface_counters(agent, source_id_index, ifindex, counters)
       if not all_agents[agent] then all_agents[agent] = {} end
@@ -264,8 +275,6 @@ local function sFlow_tap_factory()
 	 for record_pos in sample_records_iter(pos + 2, "sflow.counters_sample.counters_records") do
 	    process_counter_sample_record(agent, source_id_index, record_pos)
 	 end
-
-	 debug(string.format("source_id_type: %d\nsource_id_index: %d", source_id_type or 0, source_id_index or 0))
       end
    end
 
@@ -322,6 +331,7 @@ local function sFlow_tap_factory()
    function tap_sflow.reset()
       sflow_packets = 0
       all_agents = {}
+      debug("reset")
    end
 
    return {tap = tap_sflow, res = all_agents, sflow_packets = sflow_packets}
@@ -336,6 +346,7 @@ if gui_enabled() then
 
       -- Instantiate a new tap
       local sflow_counter_samples = sFlow_tap_factory()
+      local res = sflow_counter_samples.res
 
       local function remove()
 	 -- this way we remove the listener that otherwise will remain running indefinitely
@@ -346,27 +357,32 @@ if gui_enabled() then
       tw:set_atclose(remove)
 
       sflow_counter_samples.tap.draw = function()
-	 num_draws = num_draws + 1
 	 debug("drawing Counter samples!")
+	 num_draws = num_draws + 1
+
 	 tw:clear()
 
-	 for agent, agent_data in pairs(sflow_counter_samples.res) do
+	 for agent, agent_data in pairs(all_agents) do
 	    for source_id, source_vals in pairs(agent_data) do
 	       tw:append(string.format("%s (source_id: %d):\n", agent, source_id))
 	       for ifindex, counter_vals in pairs(source_vals) do
-		  tw:append(string.format("if: %d \tin bytes: %d\t out_bytes: %d",
-					  ifindex, counter_vals.ifinoct, counter_vals.ifoutoct))
+		  tw:append(string.format(" if: %d \tin: %s\t out: %s\n",
+					  ifindex,
+					  bytesToSize(counter_vals.ifinoct),
+					  bytesToSize(counter_vals.ifoutoct)))
 	       end
 	    end
 	 end
       end
+
+      retap_packets()
    end
 
    register_menu("ntop/sFlow/Counters", sflow_counter_samples_menu, MENU_TOOLS_UNSORTED)
 else -- no GUI
    local sflow_counter_samples = sFlow_tap_factory()
    sflow_counter_samples.tap.draw = function()
-       tprint(sflow_counter_samples.res)
+      tprint(sflow_counter_samples.res)
    end
 end
 
