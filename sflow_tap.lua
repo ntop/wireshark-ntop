@@ -78,6 +78,7 @@ for _, f in ipairs({"sflow_245.version",
 		    "sflow.counters_sample.source_id_index",
 		    "sflow.counters_sample.counters_records",
 		    "sflow_245.counters_record_format",
+		    "sflow_245.ifindex",
 		    "sflow_245.ifspeed",
 		    "sflow_245.ifinoct",
 		    "sflow_245.ifoutoct",
@@ -99,9 +100,10 @@ local function sFlow_tap_factory()
    -- here we will store all agents counters and flows
    local all_agents = {}
 
-   local function set_agent_interface_counters(agent, if_idx, counters)
+   local function set_agent_interface_counters(agent, source_id_index, ifindex, counters)
       if not all_agents[agent] then all_agents[agent] = {} end
-      all_agents[agent][if_idx] = counters
+      if not all_agents[agent][source_id_index] then all_agents[agent][source_id_index] = {} end
+      all_agents[agent][source_id_index][ifindex] = counters
    end
 
    -- Searches fields in order. When multiple fields with the same name are found
@@ -206,14 +208,15 @@ local function sFlow_tap_factory()
       end
    end
 
-   local function process_counter_sample_record(agent, if_idx, pos)
-      debug(string.format("COUNTER SAMPLE RECORD: %d if_idx: %d", pos, if_idx))
+   local function process_counter_sample_record(agent, source_id_index, pos)
+      debug(string.format("COUNTER SAMPLE RECORD: %d source_id_index: %d", pos, source_id_index))
       local pos_enterprise, enterprise = get_field_value_number("sflow.enterprise",  pos)
       local pos_record_fmt, record_fmt = get_field_value_number("sflow_245.counters_record_format", pos_enterprise)
 
       -- enterprise == 0: standard sFlow
       -- record_fmt == 2: generic interface counters
       if enterprise == 0 and record_fmt == 1 then
+	 local _, ifindex  = get_field_value_number("sflow_245.ifindex", pos_enterprise)
 	 local _, ifspeed  = get_field_value_string("sflow_245.ifspeed", pos_enterprise)
 	 local _, ifinoct  = get_field_value_string("sflow_245.ifinoct", pos_enterprise)
 	 local _, ifoutoct = get_field_value_string("sflow_245.ifoutoct", pos_enterprise)
@@ -223,7 +226,8 @@ local function sFlow_tap_factory()
 	 ifoutoct = tonumber(ifoutoct or 0)
 	 ifspeed  = tonumber(ifspeed or 0)
 
-	 set_agent_interface_counters(agent, if_idx, {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = ifspeed})
+	 set_agent_interface_counters(agent, source_id_index, ifindex,
+				      {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = ifspeed})
 	 debug(string.format("\tifinoct: %d ifoutoct: %d ifspeed: %d", ifinoct, ifoutoct, ifspeed))
 
       elseif enterprise == 0 and record_fmt == 4 then -- 100 BaseVG interface counters - see RFC 2020
@@ -234,7 +238,7 @@ local function sFlow_tap_factory()
 	 local ifinoct = tonumber(ifinoct_high or 0) + tonumber(ifinoct_norm or 0)
 	 ifoutoct = tonumber(ifoutoct or 0)
 
-	 set_agent_interface_counters(agent, if_idx, {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = 1000000000})
+	 -- set_agent_interface_counters(agent, source_id_index, {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = 1000000000})
       end
    end
 
@@ -254,8 +258,8 @@ local function sFlow_tap_factory()
       local _, source_id_type = get_field_value_number("sflow.counters_sample.source_id_type", pos)
 
       if source_id_type == 0 then -- ifIndex
-	 debug(string.format("COUNTER SAMPLE: %d", pos))
 	 local _, source_id_index = get_field_value_number("sflow.counters_sample.source_id_index", pos + 1)
+	 debug(string.format("COUNTER SAMPLE: %d index: %d", pos, source_id_index))
 
 	 for record_pos in sample_records_iter(pos + 2, "sflow.counters_sample.counters_records") do
 	    process_counter_sample_record(agent, source_id_index, record_pos)
@@ -345,13 +349,14 @@ if gui_enabled() then
 	 num_draws = num_draws + 1
 	 debug("drawing Counter samples!")
 	 tw:clear()
-	 tprint(sflow_counter_samples.res)
-	 for agent, agent_data in pairs(sflow_counter_samples.res) do
-	    tw:append(string.format("%s:\n", agent))
 
-	    for counter, counter_vals in pairs(agent_data) do
-	       tw:append(string.format("if: %d \tin bytes: %d\t out_bytes: %d",
-				       counter, counter_vals.ifinoct, counter_vals.ifoutoct))
+	 for agent, agent_data in pairs(sflow_counter_samples.res) do
+	    for source_id, source_vals in pairs(agent_data) do
+	       tw:append(string.format("%s (source_id: %d):\n", agent, source_id))
+	       for ifindex, counter_vals in pairs(source_vals) do
+		  tw:append(string.format("if: %d \tin bytes: %d\t out_bytes: %d",
+					  ifindex, counter_vals.ifinoct, counter_vals.ifoutoct))
+	       end
 	    end
 	 end
       end
