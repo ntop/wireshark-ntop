@@ -44,12 +44,44 @@ local function tprint(tbl, indent)
    end
 end
 
+function pairs_by_keys(t, f)
+  local a = {}
+
+  for n in pairs(t) do table.insert(a, n) end
+
+  table.sort(a, f)
+  local i = 0      -- iterator variable
+  local iter = function ()   -- iterator function
+    i = i + 1
+    if a[i] == nil then return nil
+    else return a[i], t[a[i]]
+    end
+  end
+
+  return iter
+end
+
 -- Converts bytes into a human readable representation
-local function bytesToSize(bytes)
+local function bytes_to_size(bytes)
+   if bytes <= 0 then return "0.00 B" end
+
    local units = {"B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"}
    local digits = math.floor(math.log(bytes) / math.log(1024))
 
    local fmt = string.format("%.2f %s", bytes / (1024 ^ digits), units[digits + 1])
+
+   return fmt
+end
+
+-- Converts bytes into a human readable representation
+local function format_rate(bytes_rate)
+   if bytes_rate <= 0 then return "0.00 B/s" end
+
+   local bits_rate = bytes_rate * 8
+   local units = {"b/s", "Kb/s", "Mb/s", "Gb/s", "Tb/s", "Pb/s", "Eb/s", "Zb/s"}
+   local digits = math.floor(math.log(bits_rate) / math.log(1000))
+
+   local fmt = string.format("%.2f %s", bits_rate / (1000 ^ digits), units[digits + 1])
 
    return fmt
 end
@@ -77,6 +109,7 @@ end
 -- They must be explicitly listed in order to tell wireshark to dissect them
 local required_fields = {}
 for _, f in ipairs({"sflow_245.version",
+		    "sflow_245.sysuptime",
 		    "sflow_245.agent",
 		    "sflow_245.numsamples",
 		    "sflow.enterprise",
@@ -111,10 +144,36 @@ local function sFlow_tap_factory()
    -- will hold all the dissected fields
    local all_fields
 
-   local function set_agent_interface_counters(agent, source_id_index, ifindex, counters)
+   local function set_agent_interface_counters(agent, sysuptime, source_id_index, ifindex, counters)
       if not all_agents[agent] then all_agents[agent] = {} end
       if not all_agents[agent][source_id_index] then all_agents[agent][source_id_index] = {} end
-      all_agents[agent][source_id_index][ifindex] = counters
+      if not all_agents[agent][source_id_index][ifindex] then all_agents[agent][source_id_index][ifindex] = {} end
+
+      local prev_counters = all_agents[agent][source_id_index][ifindex]["counters"]
+      local prev_sysuptime = all_agents[agent][source_id_index][ifindex]["sysuptime"]
+      if prev_counters and prev_sysuptime then
+	 local deltas = {}
+
+	 for c_name, c_val in pairs(counters) do
+	    local prev_c = prev_counters[c_name]
+
+	    if prev_c ~= nil then
+	       local d = c_val - prev_c
+	       local d_sysuptime = sysuptime - prev_sysuptime
+
+	       if d < 0 then d = 0 end
+	       if d_sysuptime > 1000 then -- 1 sec
+		  debug("sysuptime delta: ", d_sysuptime)
+		  deltas[c_name] = d / d_sysuptime * 1000
+	       end
+	    end
+	 end
+
+	 all_agents[agent][source_id_index][ifindex]["deltas"] = deltas
+      end
+
+      all_agents[agent][source_id_index][ifindex]["counters"] = counters
+      all_agents[agent][source_id_index][ifindex]["sysuptime"] = sysuptime
    end
 
    -- Searches fields in order. When multiple fields with the same name are found
@@ -219,7 +278,7 @@ local function sFlow_tap_factory()
       end
    end
 
-   local function process_counter_sample_record(agent, source_id_index, pos)
+   local function process_counter_sample_record(agent, sysuptime, source_id_index, pos)
       debug(string.format("COUNTER SAMPLE RECORD: %d source_id_index: %d", pos, source_id_index))
       local pos_enterprise, enterprise = get_field_value_number("sflow.enterprise",  pos)
       local pos_record_fmt, record_fmt = get_field_value_number("sflow_245.counters_record_format", pos_enterprise)
@@ -237,7 +296,7 @@ local function sFlow_tap_factory()
 	 ifoutoct = tonumber(ifoutoct or 0)
 	 ifspeed  = tonumber(ifspeed or 0)
 
-	 set_agent_interface_counters(agent, source_id_index, ifindex,
+	 set_agent_interface_counters(agent, sysuptime, source_id_index, ifindex,
 				      {ifinoct = ifinoct, ifoutoct = ifoutoct, ifspeed = ifspeed})
 	 debug(string.format("\tifinoct: %d ifoutoct: %d ifspeed: %d", ifinoct, ifoutoct, ifspeed))
 
@@ -253,14 +312,14 @@ local function sFlow_tap_factory()
       end
    end
 
-   local function process_flow_sample_record(agent, pos)
+   local function process_flow_sample_record(agent, sysuptime, pos)
 --      debug(string.format("FLOW SAMPLE RECORD: %d", pos))
       -- local pos_eth_src, eth_src = get_field_value_string("eth.src", pos)
       -- local pos_eth_dst, eth_dst = get_field_value_string("eth.dst", pos)
       -- debug(string.format("agent: %s\neth.src: %s\neth.dst: %s", agent or '', eth_src or '', eth_dst or ''))
    end
 
-   local function process_counter_sample(agent, pos)
+   local function process_counter_sample(agent, sysuptime, pos)
       -- The most significant byte of the source_id (sflow.counters_sample.source_id_type)
       -- is used to indicate the type of sFlowDataSource:
       -- 0 = ifIndex
@@ -273,12 +332,12 @@ local function sFlow_tap_factory()
 	 debug(string.format("COUNTER SAMPLE: %d index: %d", pos, source_id_index))
 
 	 for record_pos in sample_records_iter(pos + 2, "sflow.counters_sample.counters_records") do
-	    process_counter_sample_record(agent, source_id_index, record_pos)
+	    process_counter_sample_record(agent, sysuptime, source_id_index, record_pos)
 	 end
       end
    end
 
-   local function process_flow_sample(agent, pos)
+   local function process_flow_sample(agent, sysuptime, pos)
       -- see comments for process_counter_sample source_id_type that are equivalent
       local _, source_id_class = get_field_value_number("sflow.flow_sample.source_id_class", pos)
 
@@ -287,21 +346,21 @@ local function sFlow_tap_factory()
 	 local _, source_id_index = get_field_value_number("sflow.counters_sample.source_id_index", pos + 1)
 
 	 for record_pos in sample_records_iter(pos + 2, "sflow.flow_sample.flow_record") do
-	    process_flow_sample_record(agent, record_pos)
+	    process_flow_sample_record(agent, sysuptime, record_pos)
 	 end
       end
    end
 
-   local function process_sample(agent, pos)
+   local function process_sample(agent, sysuptime, pos)
       local pos_sample_type, field_sample_type = search_field("sflow_245.sampletype", pos)
 
       if field_sample_type then
 	 local sample_type = get_number(field_sample_type.value)
 
 	 if sample_type == 1 then     -- flow sample
-	    process_flow_sample(agent, pos_sample_type)
+	    process_flow_sample(agent, sysuptime, pos_sample_type)
 	 elseif sample_type == 2 then -- counter sample
-	    process_counter_sample(agent, pos_sample_type)
+	    process_counter_sample(agent, sysuptime, pos_sample_type)
 	 end
       end
    end
@@ -321,9 +380,10 @@ local function sFlow_tap_factory()
       end
 
       local _, agent = get_field_value_string("sflow_245.agent")
+      local _, sysuptime = get_field_value_string("sflow_245.sysuptime")
 
       for sample_pos in samples_iter() do
-	 process_sample(agent, sample_pos)
+	 process_sample(agent, sysuptime, sample_pos)
       end
    end
 
@@ -362,16 +422,47 @@ if gui_enabled() then
 
 	 tw:clear()
 
-	 for agent, agent_data in pairs(all_agents) do
-	    for source_id, source_vals in pairs(agent_data) do
-	       tw:append(string.format("%s (source_id: %d):\n", agent, source_id))
-	       for ifindex, counter_vals in pairs(source_vals) do
-		  tw:append(string.format(" if: %d \tin: %s\t out: %s\n",
-					  ifindex,
-					  bytesToSize(counter_vals.ifinoct),
-					  bytesToSize(counter_vals.ifoutoct)))
+	 for agent, agent_data in pairs_by_keys(all_agents) do
+	    tw:append(string.format("agent: %s\n", agent))
+	    tw:append(string.format("%14s %14s %14s %14s %14s\n",
+				    "INTERFACE",
+				    "IN BYTES", "OUT BYTES",
+				    "IN RATE", "OUT RATE"))
+
+	    for source_id, source_vals in pairs_by_keys(agent_data) do
+	       -- do not print the source id as it is uncommon to have
+	       -- multiple source ids for the same interface
+	       -- tw:append(string.format("%s (source_id: %d):\n", agent, source_id))
+	       for ifindex, if_vals in pairs_by_keys(source_vals) do
+		  local counter_vals = if_vals["counters"]
+		  local delta_vals = if_vals["deltas"]
+
+		  if counter_vals then
+		     local ifinoct  = counter_vals.ifinoct  or 0
+		     local ifoutoct = counter_vals.ifoutoct or 0
+
+		     if ifinoct > 0 or ifoutoct > 0 then
+			tw:append(string.format("%14s %14s %14s",
+						tostring(ifindex),
+						bytes_to_size(ifinoct),
+						bytes_to_size(ifoutoct)))
+
+			if delta_vals then
+			   local delta_ifinoct  = delta_vals.ifinoct  or 0
+			   local delta_ifoutoct = delta_vals.ifoutoct or 0
+			   if delta_ifinoct > 0 or delta_ifoutoct > 0 then
+			      tw:append(string.format(" %14s %14s",
+						      format_rate(delta_ifinoct),
+						      format_rate(delta_ifoutoct)))
+			   end
+			end
+			tw:append("\n")
+		     end
+		  end
 	       end
 	    end
+
+	    tw:append("\n")
 	 end
       end
 
@@ -382,8 +473,20 @@ if gui_enabled() then
 else -- no GUI
    local sflow_counter_samples = sFlow_tap_factory()
    sflow_counter_samples.tap.draw = function()
-      tprint(sflow_counter_samples.res)
+      tprint(all_agents)
+      for agent, agent_data in pairs_by_keys(all_agents) do
+	 debug(string.format("agent: %s:\n", agent))
+	 for source_id, source_vals in pairs_by_keys(agent_data) do
+	    for ifindex, if_vals in pairs_by_keys(source_vals) do
+	       local counter_vals = if_vals["counters"]
+	       if counter_vals.ifinoct > 0 or counter_vals.ifoutoct > 0 then
+		  debug(string.format(" if: %d \tin: %s\t out: %s\n",
+				      ifindex,
+				      format_rate(counter_vals.ifinoct),
+				      format_rate(counter_vals.ifoutoct)))
+		  end
+	       end
+	    end
+      end
    end
 end
-
-
