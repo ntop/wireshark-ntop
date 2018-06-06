@@ -1,4 +1,4 @@
---
+---
 -- (C) 2017-18 - ntop.org
 --
 --
@@ -61,7 +61,7 @@ function pairs_by_keys(t, f)
   return iter
 end
 
--- Converts bytes into a human readable representation
+-- Converts bytes into a human-readable representation
 local function bytes_to_size(bytes)
    if bytes <= 0 then return "0.00 B" end
 
@@ -73,7 +73,7 @@ local function bytes_to_size(bytes)
    return fmt
 end
 
--- Converts bytes into a human readable representation
+-- Converts a rate in bytes into a human-readable rate in bits per second
 local function format_rate(bytes_rate)
    if bytes_rate <= 0 then return "0.00 B/s" end
 
@@ -83,6 +83,15 @@ local function format_rate(bytes_rate)
 
    local fmt = string.format("%.2f %s", bits_rate / (1000 ^ digits), units[digits + 1])
 
+   return fmt
+end
+
+-- converts a ratio into a human-readable percentage
+local function format_pct(ratio)
+   ratio = ratio * 100
+   if ratio < 0.01 then ratio = 0 end
+
+   local fmt = string.format("%.2f %%", ratio)
    return fmt
 end
 
@@ -423,11 +432,16 @@ if gui_enabled() then
 	 tw:clear()
 
 	 for agent, agent_data in pairs_by_keys(all_agents) do
+	    local tot_ifinoct       = 0
+	    local tot_ifoutoct      = 0
+	    local tot_ifinoct_rate  = 0
+	    local tot_ifoutoct_rate = 0
+
 	    tw:append(string.format("agent: %s\n", agent))
-	    tw:append(string.format("%14s %14s %14s %14s %14s\n",
+	    tw:append(string.format("%14s %14s %14s %14s %14s %14s\n",
 				    "INTERFACE",
 				    "IN BYTES", "OUT BYTES",
-				    "IN RATE", "OUT RATE"))
+				    "IN RATE", "OUT RATE", "UTILIZATION"))
 
 	    for source_id, source_vals in pairs_by_keys(agent_data) do
 	       -- do not print the source id as it is uncommon to have
@@ -438,6 +452,7 @@ if gui_enabled() then
 		  local delta_vals = if_vals["deltas"]
 
 		  if counter_vals then
+		     local ifspeed  = counter_vals.ifspeed
 		     local ifinoct  = counter_vals.ifinoct  or 0
 		     local ifoutoct = counter_vals.ifoutoct or 0
 
@@ -447,6 +462,9 @@ if gui_enabled() then
 						bytes_to_size(ifinoct),
 						bytes_to_size(ifoutoct)))
 
+			tot_ifinoct  = tot_ifinoct  + ifinoct
+			tot_ifoutoct = tot_ifoutoct + ifoutoct
+
 			if delta_vals then
 			   local delta_ifinoct  = delta_vals.ifinoct  or 0
 			   local delta_ifoutoct = delta_vals.ifoutoct or 0
@@ -454,6 +472,21 @@ if gui_enabled() then
 			      tw:append(string.format(" %14s %14s",
 						      format_rate(delta_ifinoct),
 						      format_rate(delta_ifoutoct)))
+
+			      tot_ifinoct_rate  = tot_ifinoct_rate  + delta_ifinoct
+			      tot_ifoutoct_rate = tot_ifoutoct_rate + delta_ifoutoct
+
+			      if ifspeed and ifspeed > 0 then
+				 local utilization_in  = 8 * delta_ifinoct  / ifspeed
+				 local utilization_out = 8 * delta_ifoutoct / ifspeed
+				 local utilization = utilization_in
+
+				 if utilization_out > utilization_in then
+				    utilization = utilization_out
+				 end
+				 debug(utilization)
+				 tw:append(string.format(" %14s", format_pct(utilization)))
+			      end
 			   end
 			end
 			tw:append("\n")
@@ -461,7 +494,12 @@ if gui_enabled() then
 		  end
 	       end
 	    end
-
+	    tw:append(string.format("%14s %14s %14s %14s %14s\n",
+				    "TOTAL",
+				    bytes_to_size(tot_ifinoct),
+				    bytes_to_size(tot_ifoutoct),
+				    format_rate(tot_ifinoct_rate),
+				    format_rate(tot_ifoutoct_rate)))
 	    tw:append("\n")
 	 end
       end
