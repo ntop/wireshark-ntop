@@ -44,10 +44,25 @@ local function tprint(tbl, indent)
    end
 end
 
-function pairs_by_keys(t, f)
+-- Helper function to sort in ascending order
+local function sort_asc(a,b)
+  return (a < b)
+end
+
+-- Helper function to sort in descending order
+local function sort_desc(a,b)
+  return (a > b)
+end
+
+-- Iterate table pairs (key, value) ordered by key
+local function pairs_by_keys(t, f)
   local a = {}
 
   for n in pairs(t) do table.insert(a, n) end
+
+  if not f then
+     f = sort_asc
+  end
 
   table.sort(a, f)
   local i = 0      -- iterator variable
@@ -61,7 +76,27 @@ function pairs_by_keys(t, f)
   return iter
 end
 
--- Converts bytes into a human-readable representation
+-- Iterate table pairs (key, value) ordered by value
+local function pairs_by_values(t, f)
+  local a = {}
+  for n in pairs(t) do table.insert(a, n) end
+
+  if not f then
+     f = sort_asc
+  end
+
+  table.sort(a, function(x, y) return f(t[x], t[y]) end)
+  local i = 0      -- iterator variable
+  local iter = function ()   -- iterator function
+    i = i + 1
+    if a[i] == nil then return nil
+    else return a[i], t[a[i]]
+    end
+  end
+  return iter
+end
+
+-- Convert bytes into a human-readable representation
 local function bytes_to_size(bytes)
    if bytes <= 0 then return "0.00 B" end
 
@@ -73,7 +108,7 @@ local function bytes_to_size(bytes)
    return fmt
 end
 
--- Converts a rate in bytes into a human-readable rate in bits per second
+-- Convert a rate in bytes into a human-readable rate in bits per second
 local function format_rate(bytes_rate)
    if bytes_rate <= 0 then return "0.00 B/s" end
 
@@ -86,7 +121,7 @@ local function format_rate(bytes_rate)
    return fmt
 end
 
--- converts a ratio into a human-readable percentage
+-- Convert a ratio into a human-readable percentage
 local function format_pct(ratio)
    ratio = ratio * 100
    if ratio < 0.01 then ratio = 0 end
@@ -135,35 +170,57 @@ for _, f in ipairs({"sflow_245.version",
 		    "sflow_245.ifspeed",
 		    "sflow_245.ifinoct",
 		    "sflow_245.ifoutoct",
+		    "sflow_245.header_protocol",
 		    "sflow.flow_sample.source_id_class",
 		    "sflow.flow_sample.index",
 		    "sflow.flow_sample.flow_record",
-		    "eth.src","eth.dst",
-		    "ip.src", "ip.dst"}) do
+		    "sflow.flow_sample.sampling_rate",
+		    "eth.type", "ip.src", "ip.dst", "ip.len"}) do
    required_fields[f] = Field.new(f)
 end
 
 -- this is going to be our counter
 local sflow_packets = 0
 -- here we will store all agents counters and flows
-local all_agents = {}
+local agent_counters    = {}
+local agent_flows       = {}
 
 local function sFlow_tap_factory(tap_type)
    -- tap_type is either "counter_samples_tap" or "flow_samples_tap"
+   --- to tap on counter samples or flow samples, respectively
    if tap_type ~= "counter_samples_tap" and tap_type ~= "flow_samples_tap" then
       tap_type = "counter_samples_tap"
    end
+
    -- will hold all the dissected fields
    local all_fields
 
+   -- Calculate the sysuptime delta and return it in seconds
+   local function sysuptime_delta_secs(new_sysuptime, old_sysuptime)
+      local d_sysuptime = new_sysuptime - old_sysuptime
 
+      if d_sysuptime >= 1000 then -- 1 sec
+	 return d_sysuptime / 1000
+      elseif d_sysuptime > 10 then
+	 -- seems that there are buggy sflow agents that export the sysuptime in seconds
+	 -- so we assume that if we have two samples for the same agent and source within less
+	 -- than one second then the sysuptime is expressed in seconds rather than in milliseconds
+	 return d_sysuptime
+      end
+
+      return 1
+   end
+
+   -- Populates a table that keeps interface counters for every agent, source id, and interface index.
+   -- Counters include input and output octets, and the interface speed.
    local function set_agent_interface_counters(agent, sysuptime, source_id_index, ifindex, counters)
-      if not all_agents[agent] then all_agents[agent] = {} end
-      if not all_agents[agent][source_id_index] then all_agents[agent][source_id_index] = {} end
-      if not all_agents[agent][source_id_index][ifindex] then all_agents[agent][source_id_index][ifindex] = {} end
+      if not agent_counters[agent] then agent_counters[agent] = {} end
+      if not agent_counters[agent][source_id_index] then agent_counters[agent][source_id_index] = {} end
+      if not agent_counters[agent][source_id_index][ifindex] then agent_counters[agent][source_id_index][ifindex] = {} end
 
-      local prev_counters = all_agents[agent][source_id_index][ifindex]["counters"]
-      local prev_sysuptime = all_agents[agent][source_id_index][ifindex]["sysuptime"]
+      -- If there are previous values, then we can compute deltas and determine the link load of the interface
+      local prev_counters = agent_counters[agent][source_id_index][ifindex]["counters"]
+      local prev_sysuptime = agent_counters[agent][source_id_index][ifindex]["sysuptime"]
       if prev_counters and prev_sysuptime then
 	 local deltas = {}
 
@@ -172,24 +229,63 @@ local function sFlow_tap_factory(tap_type)
 
 	    if prev_c ~= nil then
 	       local d = c_val - prev_c
-	       local d_sysuptime = sysuptime - prev_sysuptime
+	       local d_sysuptime = sysuptime_delta_secs(sysuptime, prev_sysuptime)
 
-	       if d < 0 then d = 0 end
-	       if d_sysuptime > 1000 then -- 1 sec
---		  debug("sysuptime delta: ", d_sysuptime)
-		  deltas[c_name] = d / d_sysuptime * 1000
-	       end
+	       deltas[c_name] = d / d_sysuptime
 	    end
 	 end
 
-	 all_agents[agent][source_id_index][ifindex]["deltas"] = deltas
+	 agent_counters[agent][source_id_index][ifindex]["deltas"] = deltas
       end
 
-      all_agents[agent][source_id_index][ifindex]["counters"] = counters
-      all_agents[agent][source_id_index][ifindex]["sysuptime"] = sysuptime
+      if prev_counters ~= nil then
+	 -- debug(string.format("prev in: %d", prev_counters["ifinoct"] or nil))
+	 -- debug(string.format("%d %d ifin: %d was: %d", source_id_index, ifindex, counters["ifinoct"], 10))
+      end
+      agent_counters[agent][source_id_index][ifindex]["counters"] = counters
+      agent_counters[agent][source_id_index][ifindex]["sysuptime"] = sysuptime
    end
 
-   -- Searches fields in order. When multiple fields with the same name are found
+   -- Populates a table that keeps talkers for every agent and every source id. The sampling rate
+   -- is used to scale up samples.
+   local function set_agent_talkers(agent, sysuptime, source_id_index, sampling_rate, ip_src, ip_dst, ip_len)
+      local src_delta, dst_delta
+      local d_sysuptime, d_val
+
+      if not agent_flows[agent] then agent_flows[agent] = {} end
+      if not agent_flows[agent][source_id_index] then agent_flows[agent][source_id_index] = {sources = {}, dests = {}} end
+
+      local prev_src = agent_flows[agent][source_id_index]["sources"][ip_src]
+      local prev_dst = agent_flows[agent][source_id_index]["dests"][ip_dst]
+
+      local src_tot =  agent_flows[agent][source_id_index]["sources"][ip_src]
+      if src_tot then src_tot = src_tot["tot"] else src_tot = 0 end
+      src_tot = src_tot + (ip_len * sampling_rate)
+
+      if prev_src then
+	 d_sysuptime = sysuptime_delta_secs(sysuptime, prev_src["sysuptime"])
+	 d_val = src_tot - prev_src["tot"]
+	 if d_val < 0 then d_val = 0 end
+	 src_delta = d_val / d_sysuptime
+      end
+
+      agent_flows[agent][source_id_index]["sources"][ip_src] = {tot = src_tot, sysuptime = sysuptime, delta_tot = src_delta}
+
+      local dst_tot =  agent_flows[agent][source_id_index]["dests"][ip_dst]
+      if dst_tot then dst_tot = dst_tot["tot"] else dst_tot = 0 end
+      dst_tot = dst_tot + (ip_len * sampling_rate)
+
+      if prev_dst then
+	 d_sysuptime = sysuptime_delta_secs(sysuptime, prev_dst["sysuptime"])
+	 d_val = dst_tot - prev_dst["tot"]
+	 if d_val < 0 then d_val = 0 end
+	 dst_delta = d_val / d_sysuptime
+      end
+
+      agent_flows[agent][source_id_index]["dests"][ip_dst] = {tot = dst_tot, sysuptime = sysuptime, delta_tot = dst_delta}
+   end
+
+   -- Search fields in order. When multiple fields with the same name are found
    -- then only the first field is returned
    local function search_field(field_name, start_pos)
       local pos = start_pos or 1
@@ -201,7 +297,7 @@ local function sFlow_tap_factory(tap_type)
       end
    end
 
-   -- Searches a field and, if found, accesses and returns field value properly casted using fnct
+   -- Search a field and, if found, accesses and returns field value properly casted using fnct
    local function get_field_value(field_name, start_pos, fnct)
       local pos, field = search_field(field_name, start_pos)
 
@@ -224,6 +320,7 @@ local function sFlow_tap_factory(tap_type)
       if field then  return pos, field end
    end
 
+   -- Iterate sflow samples in an sFlow packet
    local function samples_iter()
       local pos_sflow, field_sflow             = search_field("sflow")
       local pos_num_samples, field_num_samples = search_field("sflow_245.numsamples", pos_sflow)
@@ -231,6 +328,11 @@ local function sFlow_tap_factory(tap_type)
       if not field_num_samples then
 	 return function() return nil end -- no samples (malformed packet?)
       end
+
+      -- sFlow packets can actually contain flow samples of sFlow traffic. This causes issues as wireshark
+      -- would try to parse also the inner sFlow flow samples as if they were regular sFlow.
+      -- To prevent inner sFlow flow samples to be taken by wireshark, we compute the expected offset of
+      -- any sample, and return the sample only if its offset matches the expected offset.
 
       local cur_pos = pos_num_samples
       local expected_offset = get_number(field_num_samples.offset) + get_number(field_num_samples.len)
@@ -260,6 +362,7 @@ local function sFlow_tap_factory(tap_type)
       end
    end
 
+   -- Iterate sFlow sample records within an sFlow sample
    local function sample_records_iter(pos, which_records)
       -- multiple records can exist for the same flow sample or counter sample
       local pos_num_records, num_records = get_field_value_number(which_records, pos)
@@ -270,6 +373,9 @@ local function sFlow_tap_factory(tap_type)
 
       local cur_pos = pos_num_records
       local cur_record = 0
+
+      -- There is no need to compute an expected offset here as sample records are only
+      -- iterated within an sFlow sample and samples_iter() ensures only good samples are chosen
 
       return function()
 	 while cur_record < num_records and cur_pos <= #all_fields do
@@ -291,6 +397,7 @@ local function sFlow_tap_factory(tap_type)
       end
    end
 
+   -- Process a counter sample record
    local function process_counter_sample_record(agent, sysuptime, source_id_index, pos)
 --      debug(string.format("COUNTER SAMPLE RECORD: %d source_id_index: %d", pos, source_id_index))
       local pos_enterprise, enterprise = get_field_value_number("sflow.enterprise",  pos)
@@ -320,24 +427,31 @@ local function sFlow_tap_factory(tap_type)
       end
    end
 
-   local function process_flow_sample_record(agent, sysuptime, source_id_index, pos)
-      debug(string.format("FLOW SAMPLE RECORD: %d source_id_index: %d", pos, source_id_index))
+   -- Process a flow sample record
+   local function process_flow_sample_record(agent, sysuptime, source_id_index, sampling_rate, pos)
+--      debug(string.format("FLOW SAMPLE RECORD: %d source_id_index: %d sampling rate: %d", pos, source_id_index, sampling_rate))
       local pos_enterprise, enterprise = get_field_value_number("sflow.enterprise",  pos)
       local pos_record_fmt, record_fmt = get_field_value_number("sflow_245.flow_record_format", pos_enterprise)
+      local pos_h_proto, h_proto       = get_field_value_number("sflow_245.header_protocol", pos_enterprise)
 
       -- enterprise == 0: standard sFlow
       -- record_fmt == 1: raw packet header
-      if enterprise == 0 and record_fmt == 1 then
-	 local _, ip_src = get_field_value_string("ip.src", pos)
-	 local _, ip_dst = get_field_value_string("ip.dst", pos)
-	 debug(string.format("ip.src: %s\nip.dst: %s", ip_src or '', ip_dst or ''))
+      -- h_proto == 1: ethernet
+      if enterprise == 0 and record_fmt == 1 and h_proto == 1 then
+	 local _, eth_type = get_field_value_number("eth.type", pos)
+	 if eth_type == 2048 then -- IPv4 0x0800
+	    local _, ip_src = get_field_value_string("ip.src", pos)
+	    local _, ip_dst = get_field_value_string("ip.dst", pos)
+	    local _, ip_len = get_field_value_number("ip.len", pos)
+
+	    set_agent_talkers(agent, sysuptime, source_id_index, sampling_rate, ip_src, ip_dst, ip_len)
+	 end
       else
 	 -- TODO
       end
-
-      -- debug(string.format("agent: %s\neth.src: %s\neth.dst: %s", agent or '', eth_src or '', eth_dst or ''))
    end
 
+   -- Process a counter sample with its records
    local function process_counter_sample(agent, sysuptime, pos)
       -- The most significant byte of the source_id (sflow.counters_sample.source_id_type)
       -- is used to indicate the type of sFlowDataSource:
@@ -356,20 +470,23 @@ local function sFlow_tap_factory(tap_type)
       end
    end
 
+   -- Process a flow sample with its records
    local function process_flow_sample(agent, sysuptime, pos)
       -- see comments for process_counter_sample source_id_type that are equivalent
       local _, source_id_class = get_field_value_number("sflow.flow_sample.source_id_class", pos)
 
       if source_id_class == 0 then -- ifIndex
-	 debug(string.format("FLOW SAMPLE: %d", pos))
+--	 debug(string.format("FLOW SAMPLE: %d", pos))
 	 local _, source_id_index = get_field_value_number("sflow.flow_sample.index", pos + 1)
+	 local _, sampling_rate =   get_field_value_number("sflow.flow_sample.sampling_rate", pos + 2)
 
 	 for record_pos in sample_records_iter(pos + 2, "sflow.flow_sample.flow_record") do
-	    process_flow_sample_record(agent, sysuptime, source_id_index, record_pos)
+	    process_flow_sample_record(agent, sysuptime, source_id_index, sampling_rate, record_pos)
 	 end
       end
    end
 
+   -- Process an sFlow sample
    local function process_sample(agent, sysuptime, pos)
       local pos_sample_type, field_sample_type = search_field("sflow_245.sampletype", pos)
 
@@ -384,8 +501,10 @@ local function sFlow_tap_factory(tap_type)
       end
    end
 
-   -- first we declare the tap called "sflow tap" with the filter it is going to use
+   -- Declare the tap called "sflow tap" with the filter it is going to use
    local listener_filter = "sflow_245.version == 5"
+
+   -- Filters are created on the basis of the tap type to avoid unnecessary processing
    if tap_type == "counter_samples_tap" then
       -- counter samples have type 2
       listener_filter = string.format("(%s) && (%s)", listener_filter, "sflow_245.sampletype == 2")
@@ -418,13 +537,17 @@ local function sFlow_tap_factory(tap_type)
 
    -- this function will be called at the end of the capture run
    function tap_sflow.reset()
-      sflow_packets = 0
-      all_agents = {}
+      sflow_packets     = 0
+      agent_counters    = {}
+      agent_flows       = {}
    end
 
-   return {tap = tap_sflow, res = all_agents, sflow_packets = sflow_packets}
+   return {tap = tap_sflow, res = agent_counters, sflow_packets = sflow_packets}
 end
 
+-- Returns an output function that can be used either within the wireshark gui as
+-- well as directly from tshark. This make the plugin more general as it can be used
+-- in the two modes.
 local function get_output_function(text_window)
    local cleared = false
    local tw = text_window
@@ -443,10 +566,11 @@ local function get_output_function(text_window)
    end
 end
 
+-- Draw counters statistics
 local function draw_counters(text_window)
    local output = get_output_function(text_window)
 
-   for agent, agent_data in pairs_by_keys(all_agents) do
+   for agent, agent_data in pairs_by_keys(agent_counters) do
       local tot_ifinoct       = 0
       local tot_ifoutoct      = 0
       local tot_ifinoct_rate  = 0
@@ -500,7 +624,6 @@ local function draw_counters(text_window)
 			   if utilization_out > utilization_in then
 			      utilization = utilization_out
 			   end
-			   debug(utilization)
 			   line = line..string.format(" %14s", format_pct(utilization))
 			end
 		     end
@@ -523,10 +646,90 @@ local function draw_counters(text_window)
    end
 end
 
+-- Draw talkers statistics
 local function draw_talkers(text_window)
    local output = get_output_function(text_window)
 
-   output(string.format("talkers: %d", os.time()))
+   for agent, agent_data in pairs_by_keys(agent_flows) do
+      local all_srcs = {}
+      local all_dsts = {}
+      local all_src_rates = {}
+      local all_dst_rates = {}
+      local top_srcs = {}
+      local top_dsts = {}
+      local max_top = 5
+      local cur_top
+
+      output(string.format("agent: %s", agent))
+      output(string.format("%16s %16s %16s %16s %16s %16s",
+			      "SOURCE", "SOURCE BYTES", "SOURCE RATE",
+			      "DEST", "DEST BYTES", "DEST RATE"))
+
+      for source_id, source_vals in pairs_by_keys(agent_data) do
+	 -- iterate over sources
+	 -- consider at most one source for every host
+	 -- if multiple sources exist for an host, take the one with the greatest value
+	 -- output(string.format("%s (source_id: %d):", agent, source_id))
+	 for src, vals in pairs(source_vals["sources"]) do
+	    local bytes = vals["tot"]
+	    local rate = vals["delta_tot"]
+	    if not all_srcs[src] or all_srcs[src] < bytes then
+	       all_srcs[src] = bytes
+	       all_src_rates[src] = rate
+	    end
+	 end
+	 for dst, vals in pairs(source_vals["dests"]) do
+	    local bytes = vals["tot"]
+	    local rate = vals["delta_tot"]
+	    if not all_dsts[dst] or all_dsts[dst] < bytes then
+	       all_dsts[dst] = bytes
+	       all_dst_rates[dst] = rate
+	    end
+	 end
+      end
+
+      cur_top = 1
+      for src, bytes in pairs_by_values(all_srcs, sort_desc) do
+	 top_srcs[#top_srcs + 1] = {src = src, bytes = bytes}
+	 if cur_top == max_top then
+	    break
+	 end
+	 cur_top = cur_top + 1
+      end
+
+      cur_top = 1
+      for dst, bytes in pairs_by_values(all_dsts, sort_desc) do
+	 top_dsts[#top_dsts + 1] = {dst = dst, bytes = bytes}
+	 if cur_top == max_top then
+	    break
+	 end
+	 cur_top = cur_top + 1
+      end
+
+      for i = 1,max_top do
+	 local line
+	 if top_srcs[i] then
+	    local src = top_srcs[i]["src"]
+	    line = string.format("%16s %16s %16s",
+				 src, bytes_to_size(top_srcs[i]["bytes"]), format_rate(all_src_rates[src] or 0))
+	 elseif top_dsts[i] then
+	    line = string.format("%16s %16s %16s", "", "", "") -- preserve line indentation
+	 end
+
+	 if top_dsts[i] then
+	    local dst = top_dsts[i]["dst"]
+	    line = string.format("%s %16s %16s %16s",
+				 line, dst, bytes_to_size(top_dsts[i]["bytes"]), format_rate(all_dst_rates[dst] or 0))
+	 elseif top_srcs[i] then
+	    line = string.format("%s %16s %16s %16s", line, "", "", "") -- preserve line indentation
+	 end
+
+	 if line then
+	    output(line)
+	 end
+      end
+      output("")
+   end
 end
 
 if gui_enabled() then
@@ -555,7 +758,7 @@ if gui_enabled() then
 
    local function sflow_flow_samples_menu()
       -- Declare the window we will use
-      local tw = TextWindow.new("sFlow Talkers")
+      local tw = TextWindow.new("sFlow Top Talkers")
 
       -- Instantiate a new tap
       local sflow_flow_samples = sFlow_tap_factory("flow_samples_tap")
@@ -579,10 +782,10 @@ if gui_enabled() then
    register_menu("ntop/sFlow/Talkers",  sflow_flow_samples_menu,    MENU_TOOLS_UNSORTED)
    register_menu("ntop/sFlow/Counters", sflow_counter_samples_menu, MENU_TOOLS_UNSORTED)
 else -- no GUI
-   -- local sflow_counter_samples = sFlow_tap_factory("counter_samples_tap")
-   -- sflow_counter_samples.tap.draw = function()
-   --    draw_counters()
-   -- end
+   local sflow_counter_samples = sFlow_tap_factory("counter_samples_tap")
+   sflow_counter_samples.tap.draw = function()
+      draw_counters()
+   end
 
    local sflow_flow_samples = sFlow_tap_factory("flow_samples_tap")
    sflow_flow_samples.tap.draw = function()
