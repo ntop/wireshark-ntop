@@ -5,6 +5,9 @@ provide aggregated visibility on sFlow agents interfaces status and
 load as well as on the top talkers (sources and destinations) that are
 traversing the agents.
 
+The plugin creates a `Listener.new` tap to receive only sFlow counter
+samples or flow samples.
+
 sflow_tap uses:
 * Counter samples to calculate agent interfaces status, volumes of traffic
 (INput and OUTput), throughput, and utilization percentage.
